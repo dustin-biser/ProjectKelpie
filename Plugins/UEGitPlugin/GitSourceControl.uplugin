@@ -1,25 +1,23 @@
 {
-	"FileVersion" : 3,
-	"Version" : 33,
-	"VersionName" : "2.18",
-	"FriendlyName" : "Git LFS 2",
-	"Description" : "Git source control management (dev)",
-	"Category" : "Source Control",
-	"CreatedBy" : "SRombauts",
-	"CreatedByURL" : "http://srombauts.github.com",
-	"DocsURL" : "",
-	"MarketplaceURL" : "",
-	"SupportURL" : "",
-	"EnabledByDefault" : true,
-	"CanContainContent" : false,
-	"IsBetaVersion" : true,
-	"Installed" : false,
-	"Modules" :
-	[
+	"FileVersion": 3,
+	"Version": 309,
+	"VersionName": "3.09",
+	"FriendlyName": "Git LFS 2",
+	"Description": "Git source control management",
+	"Category": "Source Control",
+	"CreatedBy": "Project Borealis",
+	"CreatedByURL": "https://projectborealis.com",
+	"DocsURL": "https://github.com/ProjectBorealis/UEGitPlugin/blob/release/README.md",
+	"SupportURL": "https://github.com/ProjectBorealis/UEGitPlugin/issues",
+	"EnabledByDefault": true,
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"Installed": false,
+	"Modules": [
 		{
-			"Name" : "GitSourceControl",
-			"Type" : "Editor",
-			"LoadingPhase" : "Default"
+			"Name": "GitSourceControl",
+			"Type": "UncookedOnly",
+			"LoadingPhase": "Default"
 		}
 	]
 }

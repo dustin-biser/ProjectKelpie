@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2022 Sebastien Rombauts (sebastien.rombauts@gmail.com)
+// Copyright (c) 2014-2020 Sebastien Rombauts (sebastien.rombauts@gmail.com)
 //
 // Distributed under the MIT License (MIT) (See accompanying file LICENSE.txt
 // or copy at http://opensource.org/licenses/MIT)
@@ -9,6 +9,24 @@
 #include "ISourceControlProvider.h"
 #include "Misc/IQueuedWork.h"
 
+/** Accumulated error and info messages for a source control operation.  */
+struct FGitSourceControlResultInfo
+{
+	/** Append any messages from another FSourceControlResultInfo, ensuring to keep any already accumulated info. */
+	void Append(const FGitSourceControlResultInfo& InResultInfo)
+	{
+		InfoMessages.Append(InResultInfo.InfoMessages);
+		ErrorMessages.Append(InResultInfo.ErrorMessages);
+	}
+
+	/** Info and/or warning message storage */
+	TArray<FString> InfoMessages;
+
+	/** Potential error message storage */
+	TArray<FString> ErrorMessages;
+};
+
+
 /**
  * Used to execute Git commands multi-threaded.
  */
@@ -16,7 +34,7 @@ class FGitSourceControlCommand : public IQueuedWork
 {
 public:
 
-	FGitSourceControlCommand(const TSharedRef<class ISourceControlOperation, ESPMode::ThreadSafe>& InOperation, const TSharedRef<class IGitSourceControlWorker, ESPMode::ThreadSafe>& InWorker, const FSourceControlOperationComplete& InOperationCompleteDelegate = FSourceControlOperationComplete() );
+	FGitSourceControlCommand(const TSharedRef<class ISourceControlOperation, ESPMode::ThreadSafe>& InOperation, const TSharedRef<class IGitSourceControlWorker, ESPMode::ThreadSafe>& InWorker, const FSourceControlOperationComplete& InOperationCompleteDelegate = FSourceControlOperationComplete());
 
 	/**
 	 * This is where the real thread work is done. All work that is done for
@@ -38,6 +56,12 @@ public:
 	 */
 	virtual void DoThreadedWork() override;
 
+	/** Attempt to cancel the operation */
+	void Cancel();
+
+	/** Is the operation canceled? */
+	bool IsCanceled() const;
+
 	/** Save any results and call any registered callbacks. */
 	ECommandResult::Type ReturnResults();
 
@@ -45,8 +69,11 @@ public:
 	/** Path to the Git binary */
 	FString PathToGitBinary;
 
-	/** Path to the root of the Git repository: can be the ProjectDir itself, or any parent directory (found by the "Connect" operation) */
+	/** Path to the root of the Unreal source control repository: usually the ProjectDir */
 	FString PathToRepositoryRoot;
+
+	/** Path to the root of the Git repository: can be the ProjectDir itself, or any parent directory (found by the "Connect" operation) */
+	FString PathToGitRoot;
 
 	/** Tell if using the Git LFS file Locking workflow */
 	bool bUsingGitLfsLocking;
@@ -63,11 +90,11 @@ public:
 	/**If true, this command has been processed by the source control thread*/
 	volatile int32 bExecuteProcessed;
 
+	/**If true, this command has been cancelled*/
+	volatile int32 bCancelled;
+
 	/**If true, the source control command succeeded*/
 	bool bCommandSuccessful;
-
-	/** TODO LFS If true, the source control connection was dropped while this command was being executed*/
-	bool bConnectionDropped;
 
 	/** Current Commit full SHA1 */
 	FString CommitId;
@@ -84,9 +111,9 @@ public:
 	/** Files to perform this operation on */
 	TArray<FString> Files;
 
-	/**Info and/or warning message storage*/
-	TArray<FString> InfoMessages;
+	/** Potential error, warning and info message storage */
+	FGitSourceControlResultInfo ResultInfo;
 
-	/**Potential error message storage*/
-	TArray<FString> ErrorMessages;
+	/** Branch names for status queries */
+	TArray< FString > StatusBranchNames;
 };

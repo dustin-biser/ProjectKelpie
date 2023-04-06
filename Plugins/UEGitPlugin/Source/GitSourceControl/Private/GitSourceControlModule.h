@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2022 Sebastien Rombauts (sebastien.rombauts@gmail.com)
+// Copyright (c) 2014-2020 Sebastien Rombauts (sebastien.rombauts@gmail.com)
 //
 // Distributed under the MIT License (MIT) (See accompanying file LICENSE.txt
 // or copy at http://opensource.org/licenses/MIT)
@@ -6,18 +6,21 @@
 #pragma once
 
 #include "CoreMinimal.h"
+
 #include "Modules/ModuleInterface.h"
+#include "Modules/ModuleManager.h"
+
 #include "GitSourceControlSettings.h"
 #include "GitSourceControlProvider.h"
 
 /**
 
-UE4GitPlugin is a simple Git Source Control Plugin for Unreal Engine
+UEGitPlugin is a simple Git Source Control Plugin for Unreal Engine
 
 Written and contributed by Sebastien Rombauts (sebastien.rombauts@gmail.com)
 
 ### Supported features
-- initialize a new Git local repository ('git init') to manage your Unreal Engine 4 and 5 Game Project
+- initialize a new Git local repository ('git init') to manage your UE Game Project
   - can also create an appropriate .gitignore file as part of initialization
   - can also create a .gitattributes file to enable Git LFS (Large File System) as part of initialization
   - can also make the initial commit, with custom multi-line message
@@ -43,12 +46,8 @@ Written and contributed by Sebastien Rombauts (sebastien.rombauts@gmail.com)
 
 Known issues:
 0. False error logs after a successful push:
-To https://github.com/SRombauts/UE4GitLfs2FileLocks.git
-   ee44ff5..59da15e HEAD -> master
 
 Use "TODO LFS" in the code to track things left to do/improve/refactor:
-1. IsUsingGitLfsLocking() should be cached in the Provider to avoid calling AccessSettings() too frequently
-   it can not change without re-initializing (at least re-connect) the Provider!
 2. Implement FGitSourceControlProvider::bWorkingOffline like the SubversionSourceControl plugin
 3. Trying to deactivate Git LFS 2 file locking afterward on the "Login to Source Control" (Connect/Configure) screen
    is not working after Git LFS 2 has switched "read-only" flag on files (which needs the Checkout operation to be editable)!
@@ -58,11 +57,9 @@ Use "TODO LFS" in the code to track things left to do/improve/refactor:
        - see SubversionSourceControl plugin that deals with such flags
        - this would need a rework of the way the "bIsUsingFileLocking" is propagated, since this would no more be a configuration (or not only) but a file state
      - else we should at least revert those read-only flags when going out of "Lock mode"
-4. Optimize usage of "git lfs locks", ie reduce the use of UdpateStatus() in Operations
 
 ### What *cannot* be done presently
 - Branch/Merge are not in the current Editor workflow
-- Fetch is not in the current Editor workflow
 - Amend a commit is not in the current Editor workflow
 - Configure user name & email ('git config user.name' & git config user.email')
 
@@ -70,10 +67,8 @@ Use "TODO LFS" in the code to track things left to do/improve/refactor:
 - the Editor does not show deleted files (only when deleted externally?)
 - the Editor does not show missing files
 - missing localization for git specific messages
-- displaying states of 'Engine' assets (also needs management of 'out of tree' files)
 - renaming a Blueprint in Editor leaves a redirector file, AND modify too much the asset to enable git to track its history through renaming
 - standard Editor commit dialog asks if user wants to "Keep Files Checked Out" => no use for Git or Mercurial CanCheckOut()==false
-
  */
 class FGitSourceControlModule : public IModuleInterface
 {
@@ -87,6 +82,7 @@ public:
 	{
 		return GitSourceControlSettings;
 	}
+
 	const FGitSourceControlSettings& AccessSettings() const
 	{
 		return GitSourceControlSettings;
@@ -100,15 +96,46 @@ public:
 	{
 		return GitSourceControlProvider;
 	}
+
 	const FGitSourceControlProvider& GetProvider() const
 	{
 		return GitSourceControlProvider;
 	}
 
+	static const TArray<FString>& GetEmptyStringArray()
+	{
+		return EmptyStringArray;
+	}
+
+	/**
+	 * Singleton-like access to this module's interface.  This is just for convenience!
+	 * Beware of calling this during the shutdown phase, though.  Your module might have been unloaded already.
+	 *
+	 * @return Returns singleton instance, loading the module on demand if needed
+	 */
+	static inline FGitSourceControlModule& Get()
+	{
+		return FModuleManager::Get().LoadModuleChecked< FGitSourceControlModule >("GitSourceControl");
+	}
+
+	/** Set list of error messages that occurred after last git command */
+	static void SetLastErrors(const TArray<FText>& InErrors);
+
 private:
-	/** The Git source control provider */
+	/** The one and only Git source control provider */
 	FGitSourceControlProvider GitSourceControlProvider;
 
 	/** The settings for Git source control */
 	FGitSourceControlSettings GitSourceControlSettings;
+
+	static TArray<FString> EmptyStringArray;
+
+#if ENGINE_MAJOR_VERSION >= 5
+	// ContentBrowserDelegate Handles
+	FDelegateHandle CbdHandle_OnFilterChanged;
+	FDelegateHandle CbdHandle_OnSearchBoxChanged;
+	FDelegateHandle CbdHandle_OnAssetSelectionChanged;
+	FDelegateHandle CbdHandle_OnSourcesViewChanged;
+	FDelegateHandle CbdHandle_OnAssetPathChanged;
+#endif
 };

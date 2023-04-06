@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2022 Sebastien Rombauts (sebastien.rombauts@gmail.com)
+// Copyright (c) 2014-2020 Sebastien Rombauts (sebastien.rombauts@gmail.com)
 //
 // Distributed under the MIT License (MIT) (See accompanying file LICENSE.txt
 // or copy at http://opensource.org/licenses/MIT)
@@ -70,23 +70,6 @@ bool FGitSourceControlSettings::SetLfsUserName(const FString& InString)
 	return bChanged;
 }
 
-bool FGitSourceControlSettings::SetIsPushAfterCommitEnabled(bool bInEnabled)
-{
-	FScopeLock ScopeLock(&CriticalSection);
-	const bool bChanged = (bIsPushAfterCommitEnabled != bInEnabled);
-	if (bChanged)
-	{
-		bIsPushAfterCommitEnabled = bInEnabled;
-	}
-	return bChanged;
-}
-
-bool FGitSourceControlSettings::IsPushAfterCommitEnabled() const
-{
-	FScopeLock ScopeLock(&CriticalSection);
-	return bIsPushAfterCommitEnabled;
-}
-
 // This is called at startup nearly before anything else in our module: BinaryPath will then be used by the provider
 void FGitSourceControlSettings::LoadSettings()
 {
@@ -95,7 +78,6 @@ void FGitSourceControlSettings::LoadSettings()
 	GConfig->GetString(*GitSettingsConstants::SettingsSection, TEXT("BinaryPath"), BinaryPath, IniFile);
 	GConfig->GetBool(*GitSettingsConstants::SettingsSection, TEXT("UsingGitLfsLocking"), bUsingGitLfsLocking, IniFile);
 	GConfig->GetString(*GitSettingsConstants::SettingsSection, TEXT("LfsUserName"), LfsUserName, IniFile);
-	GConfig->GetBool(*GitSettingsConstants::SettingsSection, TEXT("IsPushAfterCommitEnabled"), bIsPushAfterCommitEnabled, IniFile);
 }
 
 void FGitSourceControlSettings::SaveSettings() const
@@ -105,5 +87,4 @@ void FGitSourceControlSettings::SaveSettings() const
 	GConfig->SetString(*GitSettingsConstants::SettingsSection, TEXT("BinaryPath"), *BinaryPath, IniFile);
 	GConfig->SetBool(*GitSettingsConstants::SettingsSection, TEXT("UsingGitLfsLocking"), bUsingGitLfsLocking, IniFile);
 	GConfig->SetString(*GitSettingsConstants::SettingsSection, TEXT("LfsUserName"), *LfsUserName, IniFile);
-	GConfig->SetBool(*GitSettingsConstants::SettingsSection, TEXT("IsPushAfterCommitEnabled"), bIsPushAfterCommitEnabled, IniFile);
 }

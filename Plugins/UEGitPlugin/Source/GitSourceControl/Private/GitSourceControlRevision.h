@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2022 Sebastien Rombauts (sebastien.rombauts@gmail.com)
+// Copyright (c) 2014-2020 Sebastien Rombauts (sebastien.rombauts@gmail.com)
 //
 // Distributed under the MIT License (MIT) (See accompanying file LICENSE.txt
 // or copy at http://opensource.org/licenses/MIT)
@@ -7,22 +7,21 @@
 
 #include "CoreMinimal.h"
 #include "ISourceControlRevision.h"
-
 #include "Runtime/Launch/Resources/Version.h"
 
 /** Revision of a file, linked to a specific commit */
 class FGitSourceControlRevision : public ISourceControlRevision
 {
 public:
-
 	/** ISourceControlRevision interface */
-#if ENGINE_MAJOR_VERSION == 5
-	virtual bool Get(FString& InOutFilename, EConcurrency::Type InConcurrency = EConcurrency::Synchronous) const override;
+#if ENGINE_MAJOR_VERSION >= 5
+	virtual bool Get( FString& InOutFilename, EConcurrency::Type InConcurrency = EConcurrency::Synchronous ) const override;
 #else
-	virtual bool Get(FString& InOutFilename) const override;
+	virtual bool Get( FString& InOutFilename ) const override;
 #endif
-	virtual bool GetAnnotated(TArray<FAnnotationLine>& OutLines) const override;
-	virtual bool GetAnnotated(FString& InOutFilename) const override;
+
+	virtual bool GetAnnotated( TArray<FAnnotationLine>& OutLines ) const override;
+	virtual bool GetAnnotated( FString& InOutFilename ) const override;
 	virtual const FString& GetFilename() const override;
 	virtual int32 GetRevisionNumber() const override;
 	virtual const FString& GetRevision() const override;

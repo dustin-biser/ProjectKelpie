@@ -1,4 +1,4 @@
-// Copyright (c) 2014-2022 Sebastien Rombauts (sebastien.rombauts@gmail.com)
+// Copyright (c) 2014-2020 Sebastien Rombauts (sebastien.rombauts@gmail.com)
 //
 // Distributed under the MIT License (MIT) (See accompanying file LICENSE.txt
 // or copy at http://opensource.org/licenses/MIT)
@@ -15,11 +15,18 @@
 #include "GitSourceControlModule.h"
 #include "GitSourceControlUtils.h"
 #include "SGitSourceControlSettings.h"
+#include "GitSourceControlRunner.h"
 #include "Logging/MessageLog.h"
 #include "ScopedSourceControlProgress.h"
 #include "SourceControlHelpers.h"
 #include "SourceControlOperations.h"
+#include "Async/Async.h"
+#include "GenericPlatform/GenericPlatformFile.h"
+#include "HAL/FileManager.h"
 #include "Interfaces/IPluginManager.h"
+#include "Misc/App.h"
+#include "Misc/EngineVersion.h"
+#include "Misc/MessageDialog.h"
 
 #define LOCTEXT_NAMESPACE "GitSourceControl"
 
@@ -37,9 +44,6 @@ void FGitSourceControlProvider::Init(bool bForceConnection)
 		}
 
 		CheckGitAvailability();
-
-		const FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
-		bUsingGitLfsLocking = GitSourceControl.AccessSettings().IsUsingGitLfsLocking();
 	}
 
 	// bForceConnection: not used anymore
@@ -47,8 +51,8 @@ void FGitSourceControlProvider::Init(bool bForceConnection)
 
 void FGitSourceControlProvider::CheckGitAvailability()
 {
-	FGitSourceControlModule& GitSourceControl = FModuleManager::GetModuleChecked<FGitSourceControlModule>("GitSourceControl");
-	FString PathToGitBinary = GitSourceControl.AccessSettings().GetBinaryPath();
+	FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
+	PathToGitBinary = GitSourceControl.AccessSettings().GetBinaryPath();
 	if(PathToGitBinary.IsEmpty())
 	{
 		// Try to find Git binary, and update settings accordingly
@@ -62,14 +66,8 @@ void FGitSourceControlProvider::CheckGitAvailability()
 	if(!PathToGitBinary.IsEmpty())
 	{
 		UE_LOG(LogSourceControl, Log, TEXT("Using '%s'"), *PathToGitBinary);
-		bGitAvailable = GitSourceControlUtils::CheckGitAvailability(PathToGitBinary, &GitVersion);
-		if(bGitAvailable)
-		{
-			CheckRepositoryStatus(PathToGitBinary);
-
-			// Register Console Commands (even without a workspace)
-			GitSourceControlConsole.Register();
-		}
+		bGitAvailable = true;
+		CheckRepositoryStatus();
 	}
 	else
 	{
@@ -77,33 +75,147 @@ void FGitSourceControlProvider::CheckGitAvailability()
 	}
 }
 
-void FGitSourceControlProvider::CheckRepositoryStatus(const FString& InPathToGitBinary)
+void FGitSourceControlProvider::UpdateSettings()
 {
+	const FGitSourceControlModule& GitSourceControl = FGitSourceControlModule::Get();
+	bUsingGitLfsLocking = GitSourceControl.AccessSettings().IsUsingGitLfsLocking();
+	LockUser = GitSourceControl.AccessSettings().GetLfsUserName();
+}
+
+void FGitSourceControlProvider::CheckRepositoryStatus()
+{
+	GitSourceControlMenu.Register();
+
+	// Make sure our settings our up to date
+	UpdateSettings();
+
 	// Find the path to the root Git directory (if any, else uses the ProjectDir)
 	const FString PathToProjectDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
-	bGitRepositoryFound = GitSourceControlUtils::FindRootDirectory(PathToProjectDir, PathToRepositoryRoot);
-	if(bGitRepositoryFound)
+	PathToRepositoryRoot = PathToProjectDir;
+	if (!GitSourceControlUtils::FindRootDirectory(PathToProjectDir, PathToGitRoot))
 	{
-		GitSourceControlMenu.Register();
+		UE_LOG(LogSourceControl, Error, TEXT("Failed to find valid Git root directory."));
+		bGitRepositoryFound = false;
+		return;
+	}
+	if (!GitSourceControlUtils::CheckGitAvailability(PathToGitBinary, &GitVersion))
+	{
+		UE_LOG(LogSourceControl, Error, TEXT("Failed to find valid Git executable."));
+		bGitRepositoryFound = false;
+		return;
+	}
 
-		// Get branch name
-		bGitRepositoryFound = GitSourceControlUtils::GetBranchName(InPathToGitBinary, PathToRepositoryRoot, BranchName);
-		if(bGitRepositoryFound)
+	TUniqueFunction<void()> InitFunc = [this]()
+	{
+		if (!IsInGameThread())
 		{
-			GitSourceControlUtils::GetRemoteUrl(InPathToGitBinary, PathToRepositoryRoot, RemoteUrl);
+			// Wait until the module interface is valid
+			IModuleInterface* GitModule;
+			do
+			{
+				GitModule = FModuleManager::Get().GetModule("GitSourceControl");
+				FPlatformProcess::Sleep(0.0f);
+			} while (!GitModule);
+		}
+
+		// Get user name & email (of the repository, else from the global Git config)
+		GitSourceControlUtils::GetUserConfig(PathToGitBinary, PathToRepositoryRoot, UserName, UserEmail);
+		
+		TMap<FString, FGitSourceControlState> States;
+		auto ConditionalRepoInit = [this, &States]()
+		{
+			if (!GitSourceControlUtils::GetBranchName(PathToGitBinary, PathToRepositoryRoot, BranchName))
+			{
+				return false;
+			}
+			GitSourceControlUtils::GetRemoteBranchName(PathToGitBinary, PathToRepositoryRoot, RemoteBranchName);
+			GitSourceControlUtils::GetRemoteUrl(PathToGitBinary, PathToRepositoryRoot, RemoteUrl);
+			const TArray<FString> Files{TEXT("*.uasset"), TEXT("*.umap")};
+			TArray<FString> LockableErrorMessages;
+			if (!GitSourceControlUtils::CheckLFSLockable(PathToGitBinary, PathToRepositoryRoot, Files, LockableErrorMessages))
+			{
+				for (const auto &ErrorMessage : LockableErrorMessages)
+				{
+					UE_LOG(LogSourceControl, Error, TEXT("%s"), *ErrorMessage);
+				}
+			}
+			const TArray<FString> ProjectDirs{FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir()),
+											  FPaths::ConvertRelativePathToFull(FPaths::ProjectConfigDir()),
+											  FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath())};
+			TArray<FString> StatusErrorMessages;
+			if (!GitSourceControlUtils::RunUpdateStatus(PathToGitBinary, PathToRepositoryRoot, bUsingGitLfsLocking, ProjectDirs, StatusErrorMessages, States))
+			{
+				return false;
+			}
+			return true;
+		};
+		if (ConditionalRepoInit())
+		{
+			TUniqueFunction<void()> SuccessFunc = [States, this]()
+			{
+				TMap<const FString, FGitState> Results;
+				if (GitSourceControlUtils::CollectNewStates(States, Results))
+				{
+					GitSourceControlUtils::UpdateCachedStates(Results);
+				}
+				Runner = new FGitSourceControlRunner();
+				bGitRepositoryFound = true;
+			};
+			if (FApp::IsUnattended() || IsRunningCommandlet())
+			{
+				SuccessFunc();
+			}
+			else
+			{
+				AsyncTask(ENamedThreads::GameThread, MoveTemp(SuccessFunc));
+			}
 		}
 		else
 		{
-			UE_LOG(LogSourceControl, Error, TEXT("'%s' is not a valid Git repository"), *PathToRepositoryRoot);
+			TUniqueFunction<void()> ErrorFunc = [States, this]()
+			{
+				UE_LOG(LogSourceControl, Error, TEXT("Failed to update repo on initialization."));
+				bGitRepositoryFound = false;
+			};
+			if (FApp::IsUnattended() || IsRunningCommandlet())
+			{
+				ErrorFunc();
+			}
+			else
+			{
+				AsyncTask(ENamedThreads::GameThread, MoveTemp(ErrorFunc));
+			}
 		}
+	};
+
+	if (FApp::IsUnattended() || IsRunningCommandlet())
+	{
+		InitFunc();
 	}
 	else
 	{
-		UE_LOG(LogSourceControl, Warning, TEXT("'%s' is not part of a Git repository"), *FPaths::ProjectDir());
+		AsyncTask(ENamedThreads::AnyHiPriThreadNormalTask, MoveTemp(InitFunc));
 	}
+}
 
-	// Get user name & email (of the repository, else from the global Git config)
-	GitSourceControlUtils::GetUserConfig(InPathToGitBinary, PathToRepositoryRoot, UserName, UserEmail);
+void FGitSourceControlProvider::SetLastErrors(const TArray<FText>& InErrors)
+{
+
+	FScopeLock Lock(&LastErrorsCriticalSection);
+	LastErrors = InErrors;
+}
+
+TArray<FText> FGitSourceControlProvider::GetLastErrors() const
+{
+	FScopeLock Lock(&LastErrorsCriticalSection);
+	TArray<FText> Result = LastErrors;
+	return Result;
+}
+
+int32 FGitSourceControlProvider::GetNumLastErrors() const
+{
+	FScopeLock Lock(&LastErrorsCriticalSection);
+	return LastErrors.Num();
 }
 
 void FGitSourceControlProvider::Close()
@@ -112,19 +224,22 @@ void FGitSourceControlProvider::Close()
 	StateCache.Empty();
 	// Remove all extensions to the "Source Control" menu in the Editor Toolbar
 	GitSourceControlMenu.Unregister();
-	// Unregister Console Commands
-	GitSourceControlConsole.Unregister();
 
 	bGitAvailable = false;
 	bGitRepositoryFound = false;
 	UserName.Empty();
 	UserEmail.Empty();
+	if (Runner)
+	{
+		delete Runner;
+		Runner = nullptr;
+	}
 }
 
 TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> FGitSourceControlProvider::GetStateInternal(const FString& Filename)
 {
 	TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe>* State = StateCache.Find(Filename);
-	if(State != NULL)
+	if (State != NULL)
 	{
 		// found cached item
 		return (*State);
@@ -132,7 +247,7 @@ TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> FGitSourceControlProvide
 	else
 	{
 		// cache an unknown state for this item
-		TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> NewState = MakeShareable( new FGitSourceControlState(Filename, bUsingGitLfsLocking) );
+		TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> NewState = MakeShareable( new FGitSourceControlState(Filename) );
 		StateCache.Add(Filename, NewState);
 		return NewState;
 	}
@@ -141,6 +256,7 @@ TSharedRef<FGitSourceControlState, ESPMode::ThreadSafe> FGitSourceControlProvide
 FText FGitSourceControlProvider::GetStatusText() const
 {
 	FFormatNamedArguments Args;
+	Args.Add(TEXT("IsAvailable"), (IsEnabled() && IsAvailable()) ? LOCTEXT("Yes", "Yes") : LOCTEXT("No", "No"));
 	Args.Add( TEXT("RepositoryName"), FText::FromString(PathToRepositoryRoot) );
 	Args.Add( TEXT("RemoteUrl"), FText::FromString(RemoteUrl) );
 	Args.Add( TEXT("UserName"), FText::FromString(UserName) );
@@ -149,7 +265,19 @@ FText FGitSourceControlProvider::GetStatusText() const
 	Args.Add( TEXT("CommitId"), FText::FromString(CommitId.Left(8)) );
 	Args.Add( TEXT("CommitSummary"), FText::FromString(CommitSummary) );
 
-	return FText::Format( NSLOCTEXT("Status", "Provider: Git\nEnabledLabel", "Local repository: {RepositoryName}\nRemote origin: {RemoteUrl}\nUser: {UserName}\nE-mail: {UserEmail}\n[{BranchName} {CommitId}] {CommitSummary}"), Args );
+	FText FormattedError;
+	const TArray<FText>& RecentErrors = GetLastErrors();
+	if (RecentErrors.Num() > 0)
+	{
+		FFormatNamedArguments ErrorArgs;
+		ErrorArgs.Add(TEXT("ErrorText"), RecentErrors[0]);
+
+		FormattedError = FText::Format(LOCTEXT("GitErrorStatusText", "Error: {ErrorText}\n\n"), ErrorArgs);
+	}
+
+	Args.Add(TEXT("ErrorText"), FormattedError);
+
+	return FText::Format( NSLOCTEXT("GitStatusText", "{ErrorText}Enabled: {IsAvailable}", "Local repository: {RepositoryName}\nRemote: {RemoteUrl}\nUser: {UserName}\nE-mail: {UserEmail}\n[{BranchName} {CommitId}] {CommitSummary}"), Args );
 }
 
 /** Quick check if source control is enabled */
@@ -171,40 +299,53 @@ const FName& FGitSourceControlProvider::GetName(void) const
 
 ECommandResult::Type FGitSourceControlProvider::GetState( const TArray<FString>& InFiles, TArray< TSharedRef<ISourceControlState, ESPMode::ThreadSafe> >& OutState, EStateCacheUsage::Type InStateCacheUsage )
 {
-	if(!IsEnabled())
+	if (!IsEnabled())
 	{
 		return ECommandResult::Failed;
 	}
 
-	TArray<FString> AbsoluteFiles = SourceControlHelpers::AbsoluteFilenames(InFiles);
-
-	if(InStateCacheUsage == EStateCacheUsage::ForceUpdate)
+	if (InStateCacheUsage == EStateCacheUsage::ForceUpdate)
 	{
-		Execute(ISourceControlOperation::Create<FUpdateStatus>(), AbsoluteFiles);
+		TArray<FString> ForceUpdate;
+		for (FString Path : InFiles)
+		{
+			// Remove the path from the cache, so it's not ignored the next time we force check.
+			// If the file isn't in the cache, force update it now.
+			if (!RemoveFileFromIgnoreForceCache(Path))
+			{
+				ForceUpdate.Add(Path);
+			}
+		}
+		if (ForceUpdate.Num() > 0)
+		{
+			Execute(ISourceControlOperation::Create<FUpdateStatus>(), ForceUpdate);
+		}
 	}
 
-	for(const auto& AbsoluteFile : AbsoluteFiles)
+	const TArray<FString>& AbsoluteFiles = SourceControlHelpers::AbsoluteFilenames(InFiles);
+
+	for (TArray<FString>::TConstIterator It(AbsoluteFiles); It; It++)
 	{
-		OutState.Add(GetStateInternal(*AbsoluteFile));
+		OutState.Add(GetStateInternal(*It));
 	}
 
 	return ECommandResult::Succeeded;
 }
 
-#if ENGINE_MAJOR_VERSION == 5
+#if ENGINE_MAJOR_VERSION >= 5
 ECommandResult::Type FGitSourceControlProvider::GetState(const TArray<FSourceControlChangelistRef>& InChangelists, TArray<FSourceControlChangelistStateRef>& OutState, EStateCacheUsage::Type InStateCacheUsage)
 {
-	return ECommandResult::Failed;
+    return ECommandResult::Failed;
 }
 #endif
 
 TArray<FSourceControlStateRef> FGitSourceControlProvider::GetCachedStateByPredicate(TFunctionRef<bool(const FSourceControlStateRef&)> Predicate) const
 {
 	TArray<FSourceControlStateRef> Result;
-	for(const auto& CacheItem : StateCache)
+	for (const auto& CacheItem : StateCache)
 	{
-		FSourceControlStateRef State = CacheItem.Value;
-		if(Predicate(State))
+		const FSourceControlStateRef& State = CacheItem.Value;
+		if (Predicate(State))
 		{
 			Result.Add(State);
 		}
@@ -215,6 +356,16 @@ TArray<FSourceControlStateRef> FGitSourceControlProvider::GetCachedStateByPredic
 bool FGitSourceControlProvider::RemoveFileFromCache(const FString& Filename)
 {
 	return StateCache.Remove(Filename) > 0;
+}
+
+bool FGitSourceControlProvider::AddFileToIgnoreForceCache(const FString& Filename)
+{
+	return IgnoreForceCache.Add(Filename) > 0;
+}
+
+bool FGitSourceControlProvider::RemoveFileFromIgnoreForceCache(const FString& Filename)
+{
+	return IgnoreForceCache.Remove(Filename) > 0;
 }
 
 /** Get files in cache */
@@ -238,10 +389,10 @@ void FGitSourceControlProvider::UnregisterSourceControlStateChanged_Handle( FDel
 	OnSourceControlStateChanged.Remove( Handle );
 }
 
-#if ENGINE_MAJOR_VERSION == 5
-ECommandResult::Type FGitSourceControlProvider::Execute(const FSourceControlOperationRef& InOperation, FSourceControlChangelistPtr InChangelist, const TArray<FString>& InFiles, EConcurrency::Type InConcurrency /* = EConcurrency::Synchronous */, const FSourceControlOperationComplete& InOperationCompleteDelegate)
+#if ENGINE_MAJOR_VERSION < 5
+ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOperationRef& InOperation, const TArray<FString>& InFiles, EConcurrency::Type InConcurrency, const FSourceControlOperationComplete& InOperationCompleteDelegate )
 #else
-ECommandResult::Type FGitSourceControlProvider::Execute(const TSharedRef<ISourceControlOperation, ESPMode::ThreadSafe>& InOperation, const TArray<FString>& InFiles, EConcurrency::Type InConcurrency /* = EConcurrency::Synchronous */, const FSourceControlOperationComplete& InOperationCompleteDelegate)
+ECommandResult::Type FGitSourceControlProvider::Execute( const FSourceControlOperationRef& InOperation, FSourceControlChangelistPtr InChangelist, const TArray<FString>& InFiles, EConcurrency::Type InConcurrency, const FSourceControlOperationComplete& InOperationCompleteDelegate )
 #endif
 {
 	if(!IsEnabled() && !(InOperation->GetName() == "Connect")) // Only Connect operation allowed while not Enabled (Repository found)
@@ -250,7 +401,7 @@ ECommandResult::Type FGitSourceControlProvider::Execute(const TSharedRef<ISource
 		return ECommandResult::Failed;
 	}
 
-	TArray<FString> AbsoluteFiles = SourceControlHelpers::AbsoluteFilenames(InFiles);
+	const TArray<FString>& AbsoluteFiles = SourceControlHelpers::AbsoluteFilenames(InFiles);
 
 	// Query to see if we allow this operation
 	TSharedPtr<IGitSourceControlWorker, ESPMode::ThreadSafe> Worker = CreateWorker(InOperation->GetName());
@@ -261,6 +412,7 @@ ECommandResult::Type FGitSourceControlProvider::Execute(const TSharedRef<ISource
 		Arguments.Add( TEXT("OperationName"), FText::FromName(InOperation->GetName()) );
 		Arguments.Add( TEXT("ProviderName"), FText::FromName(GetName()) );
 		FText Message(FText::Format(LOCTEXT("UnsupportedOperation", "Operation '{OperationName}' not supported by source control provider '{ProviderName}'"), Arguments));
+
 		FMessageLog("SourceControl").Error(Message);
 		InOperation->AddErrorMessge(Message);
 
@@ -277,25 +429,61 @@ ECommandResult::Type FGitSourceControlProvider::Execute(const TSharedRef<ISource
 	{
 		Command->bAutoDelete = false;
 
+#if UE_BUILD_DEBUG
 		UE_LOG(LogSourceControl, Log, TEXT("ExecuteSynchronousCommand(%s)"), *InOperation->GetName().ToString());
-		return ExecuteSynchronousCommand(*Command, InOperation->GetInProgressString());
+#endif
+		return ExecuteSynchronousCommand(*Command, InOperation->GetInProgressString(), false);
 	}
 	else
 	{
 		Command->bAutoDelete = true;
 
+#if UE_BUILD_DEBUG
 		UE_LOG(LogSourceControl, Log, TEXT("IssueAsynchronousCommand(%s)"), *InOperation->GetName().ToString());
+#endif
 		return IssueCommand(*Command);
 	}
 }
 
+#if ENGINE_MAJOR_VERSION < 5
 bool FGitSourceControlProvider::CanCancelOperation( const FSourceControlOperationRef& InOperation ) const
+#else
+bool FGitSourceControlProvider::CanCancelOperation( const FSourceControlOperationRef& InOperation ) const
+#endif
 {
+	// TODO: maybe support cancellation again?
+#if 0
+	for (int32 CommandIndex = 0; CommandIndex < CommandQueue.Num(); ++CommandIndex)
+	{
+		const FGitSourceControlCommand& Command = *CommandQueue[CommandIndex];
+		if (Command.Operation == InOperation)
+		{
+			check(Command.bAutoDelete);
+			return true;
+		}
+	}
+#endif
+
+	// operation was not in progress!
 	return false;
 }
 
+#if ENGINE_MAJOR_VERSION < 5
 void FGitSourceControlProvider::CancelOperation( const FSourceControlOperationRef& InOperation )
+#else
+void FGitSourceControlProvider::CancelOperation( const FSourceControlOperationRef& InOperation )
+#endif
 {
+	for (int32 CommandIndex = 0; CommandIndex < CommandQueue.Num(); ++CommandIndex)
+	{
+		FGitSourceControlCommand& Command = *CommandQueue[CommandIndex];
+		if (Command.Operation == InOperation)
+		{
+			check(Command.bAutoDelete);
+			Command.Cancel();
+			return;
+		}
+	}
 }
 
 bool FGitSourceControlProvider::UsesLocalReadOnlyState() const
@@ -313,31 +501,22 @@ bool FGitSourceControlProvider::UsesCheckout() const
 	return bUsingGitLfsLocking; // Git LFS Lock uses read-only state
 }
 
-/** Whether the provider uses individual file revisions. Used to enable partial 'Sync' operations on Content Browser Folders. */
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1
 bool FGitSourceControlProvider::UsesFileRevisions() const
 {
-	return false; // Partial 'Sync' doesn't make sense for Git, only for Perforce
+	return true;
 }
 
-/**
- * Whether the current source control client is at the latest version. Used to enable a global 'Sync' button on the Toolbar.
- * @note Experimental, hidden behind an setting in XxxEditor.ini [SourceControlSettings] DisplaySourceControlSyncStatus=true
- * @note This concept is currently only implemented for the Skein source control provider.
- */
 TOptional<bool> FGitSourceControlProvider::IsAtLatestRevision() const
 {
-	return TOptional<bool>();
+	return {};
 }
 
-/**
- * Returns the number of changes in the local workspace. Used to enable a global 'CheckIn' button on the Toolbar.
- * @note Experimental, hidden behind an setting in XxxEditor.ini [SourceControlSettings] DisplaySourceControlCheckInStatus=true
- * @note This concept is currently only implemented for the Skein source control provider.
- */
 TOptional<int> FGitSourceControlProvider::GetNumLocalChanges() const
 {
-	return TOptional<int>();
+	return {};
 }
+#endif
 
 TSharedPtr<IGitSourceControlWorker, ESPMode::ThreadSafe> FGitSourceControlProvider::CreateWorker(const FName& InOperationName) const
 {
@@ -359,20 +538,20 @@ void FGitSourceControlProvider::OutputCommandMessages(const FGitSourceControlCom
 {
 	FMessageLog SourceControlLog("SourceControl");
 
-	for(int32 ErrorIndex = 0; ErrorIndex < InCommand.ErrorMessages.Num(); ++ErrorIndex)
+	for (int32 ErrorIndex = 0; ErrorIndex < InCommand.ResultInfo.ErrorMessages.Num(); ++ErrorIndex)
 	{
-		SourceControlLog.Error(FText::FromString(InCommand.ErrorMessages[ErrorIndex]));
+		SourceControlLog.Error(FText::FromString(InCommand.ResultInfo.ErrorMessages[ErrorIndex]));
 	}
 
-	for(int32 InfoIndex = 0; InfoIndex < InCommand.InfoMessages.Num(); ++InfoIndex)
+	for (int32 InfoIndex = 0; InfoIndex < InCommand.ResultInfo.InfoMessages.Num(); ++InfoIndex)
 	{
-		SourceControlLog.Info(FText::FromString(InCommand.InfoMessages[InfoIndex]));
+		SourceControlLog.Info(FText::FromString(InCommand.ResultInfo.InfoMessages[InfoIndex]));
 	}
 }
 
 void FGitSourceControlProvider::UpdateRepositoryStatus(const class FGitSourceControlCommand& InCommand)
 {
-	// For all operations running UpdateStatus, get Commit informations:
+	// For all operations running UpdateStatus, get Commit information:
 	if (!InCommand.CommitId.IsEmpty())
 	{
 		CommitId = InCommand.CommitId;
@@ -381,19 +560,31 @@ void FGitSourceControlProvider::UpdateRepositoryStatus(const class FGitSourceCon
 }
 
 void FGitSourceControlProvider::Tick()
-{	
+{
+#if ENGINE_MAJOR_VERSION < 5
 	bool bStatesUpdated = false;
+#else
+	bool bStatesUpdated = TicksUntilNextForcedUpdate == 1;
+	if( TicksUntilNextForcedUpdate > 0 )
+	{
+		--TicksUntilNextForcedUpdate;
+	}
+#endif
 
-	for(int32 CommandIndex = 0; CommandIndex < CommandQueue.Num(); ++CommandIndex)
+	for (int32 CommandIndex = 0; CommandIndex < CommandQueue.Num(); ++CommandIndex)
 	{
 		FGitSourceControlCommand& Command = *CommandQueue[CommandIndex];
-		if(Command.bExecuteProcessed)
+
+		if (Command.bExecuteProcessed)
 		{
 			// Remove command from the queue
 			CommandQueue.RemoveAt(CommandIndex);
 
-			// Update respository status on UpdateStatus operations
-			UpdateRepositoryStatus(Command);
+			if (!Command.IsCanceled())
+			{
+				// Update repository status on UpdateStatus operations
+				UpdateRepositoryStatus(Command);
+			}
 
 			// let command update the states of any files
 			bStatesUpdated |= Command.Worker->UpdateStates();
@@ -402,7 +593,10 @@ void FGitSourceControlProvider::Tick()
 			OutputCommandMessages(Command);
 
 			// run the completion delegate callback if we have one bound
-			Command.ReturnResults();
+			if (!Command.IsCanceled())
+			{
+				Command.ReturnResults();
+			}
 
 			// commands that are left in the array during a tick need to be deleted
 			if(Command.bAutoDelete)
@@ -415,9 +609,18 @@ void FGitSourceControlProvider::Tick()
 			// of the command queue (which can happen in the completion delegate)
 			break;
 		}
+		else if (Command.bCancelled)
+		{
+			// If this was a synchronous command, set it free so that it will be deleted automatically
+			// when its (still running) thread finally finishes
+			Command.bAutoDelete = true;
+
+			Command.ReturnResults();
+			break;
+		}
 	}
 
-	if(bStatesUpdated)
+	if (bStatesUpdated)
 	{
 		OnSourceControlStateChanged.Broadcast();
 	}
@@ -433,10 +636,10 @@ TArray< TSharedRef<ISourceControlLabel> > FGitSourceControlProvider::GetLabels( 
 	return Tags;
 }
 
-#if ENGINE_MAJOR_VERSION == 5
+#if ENGINE_MAJOR_VERSION >= 5
 TArray<FSourceControlChangelistRef> FGitSourceControlProvider::GetChangelists( EStateCacheUsage::Type InStateCacheUsage )
 {
-	return TArray<FSourceControlChangelistRef>();
+    return TArray<FSourceControlChangelistRef>();
 }
 #endif
 
@@ -447,70 +650,154 @@ TSharedRef<class SWidget> FGitSourceControlProvider::MakeSettingsWidget() const
 }
 #endif
 
-ECommandResult::Type FGitSourceControlProvider::ExecuteSynchronousCommand(FGitSourceControlCommand& InCommand, const FText& Task)
+ECommandResult::Type FGitSourceControlProvider::ExecuteSynchronousCommand(FGitSourceControlCommand& InCommand, const FText& Task, bool bSuppressResponseMsg)
 {
 	ECommandResult::Type Result = ECommandResult::Failed;
 
+	struct Local
+	{
+		static void CancelCommand(FGitSourceControlCommand* InControlCommand)
+		{
+			InControlCommand->Cancel();
+		}
+	};
+
+	FText TaskText = Task;
+	// Display the progress dialog
+	if (bSuppressResponseMsg)
+	{
+		TaskText = FText::GetEmpty();
+	}
+
+	int i = 0;
+
 	// Display the progress dialog if a string was provided
 	{
-		FScopedSourceControlProgress Progress(Task);
+		// TODO: support cancellation?
+		//FScopedSourceControlProgress Progress(TaskText, FSimpleDelegate::CreateStatic(&Local::CancelCommand, &InCommand));
+		FScopedSourceControlProgress Progress(TaskText);
 
 		// Issue the command asynchronously...
 		IssueCommand( InCommand );
 
 		// ... then wait for its completion (thus making it synchronous)
-		while(!InCommand.bExecuteProcessed)
+		while (!InCommand.IsCanceled() && CommandQueue.Contains(&InCommand))
 		{
 			// Tick the command queue and update progress.
 			Tick();
 
-			Progress.Tick();
+			if (i >= 20) {
+				Progress.Tick();
+				i = 0;
+			}
+			i++;
 
 			// Sleep for a bit so we don't busy-wait so much.
 			FPlatformProcess::Sleep(0.01f);
 		}
 
-		// always do one more Tick() to make sure the command queue is cleaned up.
-		Tick();
-
-		if(InCommand.bCommandSuccessful)
+		if (InCommand.bCancelled)
+		{
+			Result = ECommandResult::Cancelled;
+		}
+		if (InCommand.bCommandSuccessful)
 		{
 			Result = ECommandResult::Succeeded;
 		}
+		else if (!bSuppressResponseMsg)
+		{
+			FMessageDialog::Open( EAppMsgType::Ok, LOCTEXT("Git_ServerUnresponsive", "Git command failed. Please check your connection and try again, or check the output log for more information.") );
+			UE_LOG(LogSourceControl, Error, TEXT("Command '%s' Failed!"), *InCommand.Operation->GetName().ToString());
+		}
 	}
 
-	// Delete the command now (asynchronous commands are deleted in the Tick() method)
-	check(!InCommand.bAutoDelete);
-
-	// ensure commands that are not auto deleted do not end up in the command queue
-	if ( CommandQueue.Contains( &InCommand ) )
+	// Delete the command now if not marked as auto-delete
+	if (!InCommand.bAutoDelete)
 	{
-		CommandQueue.Remove( &InCommand );
+		delete &InCommand;
 	}
-	delete &InCommand;
 
 	return Result;
 }
 
-ECommandResult::Type FGitSourceControlProvider::IssueCommand(FGitSourceControlCommand& InCommand)
+ECommandResult::Type FGitSourceControlProvider::IssueCommand(FGitSourceControlCommand& InCommand, const bool bSynchronous)
 {
-	if(GThreadPool != nullptr)
+	if (!bSynchronous && GThreadPool != nullptr)
 	{
-		// Queue this to our worker thread(s) for resolving
+		// Queue this to our worker thread(s) for resolving.
+		// When asynchronous, any callback gets called from Tick().
 		GThreadPool->AddQueuedWork(&InCommand);
 		CommandQueue.Add(&InCommand);
 		return ECommandResult::Succeeded;
 	}
 	else
 	{
-		FText Message(LOCTEXT("NoSCCThreads", "There are no threads available to process the source control command."));
+		UE_LOG(LogSourceControl, Log, TEXT("There are no threads available to process the source control command '%s'. Running synchronously."), *InCommand.Operation->GetName().ToString());
 
-		FMessageLog("SourceControl").Error(Message);
-		InCommand.bCommandSuccessful = false;
-		InCommand.Operation->AddErrorMessge(Message);
+		InCommand.bCommandSuccessful = InCommand.DoWork();
 
+		InCommand.Worker->UpdateStates();
+
+		OutputCommandMessages(InCommand);
+
+		// Callback now if present. When asynchronous, this callback gets called from Tick().
 		return InCommand.ReturnResults();
 	}
+}
+
+bool FGitSourceControlProvider::QueryStateBranchConfig(const FString& ConfigSrc, const FString& ConfigDest)
+{
+	// Check similar preconditions to Perforce (valid src and dest),
+	if (ConfigSrc.Len() == 0 || ConfigDest.Len() == 0)
+	{
+		return false;
+	}
+
+	if (!bGitAvailable || !bGitRepositoryFound)
+	{
+		FMessageLog("SourceControl").Error(LOCTEXT("StatusBranchConfigNoConnection", "Unable to retrieve status branch configuration from repo, no connection"));
+		return false;
+	}
+
+	// Otherwise, we can assume that whatever our user is doing to config state branches is properly synced, so just copy.
+	// TODO: maybe don't assume, and use git show instead?
+	IFileManager::Get().Copy(*ConfigDest, *ConfigSrc);
+	return true;
+}
+
+void FGitSourceControlProvider::RegisterStateBranches(const TArray<FString>& BranchNames, const FString& ContentRootIn)
+{
+	StatusBranchNames = BranchNames;
+}
+
+int32 FGitSourceControlProvider::GetStateBranchIndex(const FString& StateBranchName) const
+{
+	// How do state branches indices work?
+	// Order matters. Lower values are lower in the hierarchy, i.e., changes from higher branches get automatically merged down.
+	// The higher branch is, the stabler it is, and has changes manually promoted up.
+
+	// Check if we are checking the index of the current branch
+	// UE uses FEngineVersion for the current branch name because of UEGames setup, but we want to handle otherwise for Git repos.
+	if (StateBranchName == FEngineVersion::Current().GetBranch())
+	{
+		const int32 CurrentBranchStatusIndex = StatusBranchNames.IndexOfByKey(BranchName);
+		const bool bCurrentBranchInStatusBranches = CurrentBranchStatusIndex != INDEX_NONE;
+		// If the user's current branch is tracked as a status branch, give the proper index
+		if (bCurrentBranchInStatusBranches)
+		{
+			return CurrentBranchStatusIndex;
+		}
+		// If the current branch is not a status branch, make it the highest branch
+		// This is semantically correct, since if a branch is not marked as a status branch
+		// it merges changes in a similar fashion to the highest status branch, i.e. manually promotes them
+		// based on the user merging those changes in. and these changes always get merged from even the highest point
+		// of the stream. i.e, promoted/stable changes are always up for consumption by this branch.
+		return INT32_MAX;
+	}
+
+	// If we're not checking the current branch, then we don't need to do special handling.
+	// If it is not a status branch, there is no message
+	return StatusBranchNames.IndexOfByKey(StateBranchName);
 }
 
 #undef LOCTEXT_NAMESPACE
