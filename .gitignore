@@ -30,6 +30,7 @@
 
 # Executables
 *.exe
+!Plugins/**/*.exe
 *.out
 *.app
 *.ipa
